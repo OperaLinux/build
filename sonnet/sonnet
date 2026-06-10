@@ -227,7 +227,7 @@ install_base_system() {
         amd-ucode intel-ucode mkinitcpio grub efibootmgr os-prober
         openrc udev elogind elogind-openrc
         dbus dbus-openrc networkmanager networkmanager-openrc
-        sudo bash pacman artix-keyring artix-mirrorlist
+        sudo bash pacman glibc kbd artix-keyring artix-mirrorlist
         artix-archlinux-support archlinux-keyring
         fastfetch nano vim git curl wget jq zstd tar
         pipewire pipewire-alsa pipewire-pulse wireplumber alsa-utils
@@ -278,25 +278,25 @@ safe_resource_name() {
 choose_hostname() {
     local hostname
     while true; do
-        read -r -p "Hostname [operalinux]: " hostname
+        read -r -p "Hostname [operalinux]: " hostname </dev/tty
         hostname="${hostname:-operalinux}"
         if [[ "$hostname" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}$ ]]; then
             printf '%s' "$hostname"
             return
         fi
-        printf 'Hostname non valido. Usa lettere, numeri e trattini; niente spazi.\n' >&2
+        printf 'Invalid hostname. Use letters, numbers, and hyphens; spaces are not allowed.\n' >&2
     done
 }
 
 choose_timezone() {
     local timezone pattern
-    printf '\nTimezone: scrivi il valore completo, oppure ? per cercare.\n' >&2
-    printf 'Esempi: Europe/Rome, Europe/San_Marino, UTC\n' >&2
+    printf '\nTimezone: enter the full value, or ? to search.\n' >&2
+    printf 'Examples: Europe/Rome, Europe/San_Marino, UTC\n' >&2
     while true; do
-        read -r -p "Timezone [UTC]: " timezone
+        read -r -p "Timezone [UTC]: " timezone </dev/tty
         timezone="${timezone:-UTC}"
         if [[ "$timezone" == "?" ]]; then
-            read -r -p "Cerca timezone: " pattern
+            read -r -p "Search timezone: " pattern </dev/tty
             find "$TARGET_MOUNT/usr/share/zoneinfo" -type f \
                 ! -path '*/posix/*' ! -path '*/right/*' \
                 -printf '%P\n' | grep -Fi -- "$pattern" | sort | sed -n '1,40p' >&2 || true
@@ -306,32 +306,72 @@ choose_timezone() {
             printf '%s' "$timezone"
             return
         fi
-        printf 'Timezone non valida o non trovata: %s\n' "$timezone" >&2
+        printf 'Invalid or unknown timezone: %s\n' "$timezone" >&2
     done
 }
 
 available_locales() {
-    sed -n 's/^#\?\([A-Za-z0-9_.@-]\{1,\}[[:space:]]\+UTF-8\)$/\1/p' "$TARGET_MOUNT/etc/locale.gen" |
-        awk '{print $1}' | sort -u
+    local locale_gen="${TARGET_MOUNT}/etc/locale.gen"
+    if [[ ! -r "$locale_gen" ]]; then
+        printf '%s\n' en_US.UTF-8 it_IT.UTF-8
+        return
+    fi
+
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]*#[[:space:]]*/, "", line)
+            sub(/[[:space:]]+#.*$/, "", line)
+            split(line, fields, /[[:space:]]+/)
+            if (fields[1] ~ /^[A-Za-z0-9_.@+-]+$/ && fields[2] ~ /^UTF-?8$/) {
+                print fields[1]
+            }
+        }
+    ' "$locale_gen" | sort -u
+}
+
+normalize_locale() {
+    local locale="$1"
+    case "$locale" in
+        *.[Uu][Tt][Ff]8|*.[Uu][Tt][Ff]-8)
+            printf '%s.UTF-8' "${locale%.*}"
+            ;;
+        *_*)
+            printf '%s.UTF-8' "$locale"
+            ;;
+        *)
+            printf '%s' "$locale"
+            ;;
+    esac
+}
+
+valid_utf8_locale_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_.@+-]+\.UTF-8$ ]]
 }
 
 choose_locale() {
     local locale pattern
-    printf '\nLocale: scrivi il valore completo, oppure ? per cercare.\n' >&2
-    printf 'Esempi: en_US.UTF-8, it_IT.UTF-8\n' >&2
+    printf '\nLocale: enter the full value, or ? to search.\n' >&2
+    printf 'Examples: en_US.UTF-8, it_IT.UTF-8\n' >&2
     while true; do
-        read -r -p "Locale [en_US.UTF-8]: " locale
+        read -r -p "Locale [en_US.UTF-8]: " locale </dev/tty
         locale="${locale:-en_US.UTF-8}"
         if [[ "$locale" == "?" ]]; then
-            read -r -p "Cerca locale: " pattern
+            read -r -p "Search locale: " pattern </dev/tty
             available_locales | grep -Fi -- "$pattern" | sed -n '1,40p' >&2 || true
             continue
         fi
+        locale="$(normalize_locale "$locale")"
         if available_locales | grep -Fxq "$locale"; then
             printf '%s' "$locale"
             return
         fi
-        printf 'Locale non valida o non trovata: %s\n' "$locale" >&2
+        if valid_utf8_locale_name "$locale"; then
+            printf 'Locale is not present in locale.gen; it will be added: %s\n' "$locale" >&2
+            printf '%s' "$locale"
+            return
+        fi
+        printf 'Invalid locale: %s\n' "$locale" >&2
     done
 }
 
@@ -342,13 +382,13 @@ available_keymaps() {
 
 choose_keymap() {
     local keymap pattern
-    printf '\nKeyboard keymap: scrivi il nome, oppure ? per cercare.\n' >&2
-    printf 'Esempi: us, it, de, fr\n' >&2
+    printf '\nKeyboard keymap: enter the name, or ? to search.\n' >&2
+    printf 'Examples: us, it, de, fr\n' >&2
     while true; do
-        read -r -p "Keyboard keymap [us]: " keymap
+        read -r -p "Keyboard keymap [us]: " keymap </dev/tty
         keymap="${keymap:-us}"
         if [[ "$keymap" == "?" ]]; then
-            read -r -p "Cerca keymap: " pattern
+            read -r -p "Search keymap: " pattern </dev/tty
             available_keymaps | grep -Fi -- "$pattern" | sed -n '1,40p' >&2 || true
             continue
         fi
@@ -356,15 +396,22 @@ choose_keymap() {
             printf '%s' "$keymap"
             return
         fi
-        printf 'Keymap non valida o non trovata: %s\n' "$keymap" >&2
+        printf 'Invalid or unknown keymap: %s\n' "$keymap" >&2
     done
 }
 
 enable_locale() {
     local locale="$1"
+    local locale_gen="${TARGET_MOUNT}/etc/locale.gen"
     local escaped
+    mkdir -p "$(dirname "$locale_gen")"
+    touch "$locale_gen"
     escaped="$(printf '%s' "$locale" | sed 's/[][\/.^$*+?{}()|\\]/\\&/g')"
-    sed -i "s/^#\(${escaped}[[:space:]]\+UTF-8\)/\1/" "$TARGET_MOUNT/etc/locale.gen"
+    if grep -Eiq "^[[:space:]]*#?[[:space:]]*${escaped}[[:space:]]+UTF-?8([[:space:]]|$)" "$locale_gen"; then
+        sed -Ei "s|^[[:space:]]*#?[[:space:]]*(${escaped}[[:space:]]+UTF-?8)([[:space:]]*.*)?$|\\1|" "$locale_gen"
+    else
+        printf '%s UTF-8\n' "$locale" >> "$locale_gen"
+    fi
 }
 
 configure_identity() {
