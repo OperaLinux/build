@@ -381,12 +381,13 @@ build_iso_tree() {
     mksquashfs "$ROOTFS_DIR" "${ISO_DIR}/operalinux/${ARCH}/airootfs.sfs" \
         -noappend -comp zstd -Xcompression-level 19 2>&1 | tee -a "$LOG_FILE"
     (cd "${ISO_DIR}/operalinux/${ARCH}" && sha256sum airootfs.sfs > airootfs.sfs.sha256)
+    log "INFO" "airootfs.sfs size: $(du -h "${ISO_DIR}/operalinux/${ARCH}/airootfs.sfs" | awk '{print $1}')"
 }
 
 generate_iso() {
     log "INFO" "Generating ${ISO_PATH}"
     rm -f "$ISO_PATH"
-    grub-mkrescue -volid "$ISO_LABEL" -o "$ISO_PATH" "$ISO_DIR" 2>&1 | tee -a "$LOG_FILE"
+    grub-mkrescue -iso-level 3 -volid "$ISO_LABEL" -o "$ISO_PATH" "$ISO_DIR" 2>&1 | tee -a "$LOG_FILE"
     [[ -s "$ISO_PATH" ]] || die "ISO was not created"
     log "INFO" "Built ${ISO_PATH}"
 }
