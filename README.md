@@ -41,7 +41,7 @@ Build on an Artix or Arch-compatible host with pacman tooling and:
 
 - `basestrap` or `pacstrap`
 - `grub-mkrescue`
-- `xorriso`
+- `libisoburn` for the `xorriso` command
 - `mtools`
 - `squashfs-tools`
 - `zstd`
@@ -50,7 +50,7 @@ Build on an Artix or Arch-compatible host with pacman tooling and:
 ## Policy
 
 OperaLinux is OpenRC only. The builder refuses forbidden init packages, enables
-OpenRC services, uses eudev and elogind, and installs a pacman transaction guard.
+OpenRC services, uses Artix `udev` and elogind, and installs a pacman transaction guard.
 
 Artix repositories are configured before Arch compatibility repositories. Arch
 `core` is intentionally absent.

@@ -7,6 +7,7 @@ PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_DIR="${PROJECT_DIR}/config"
 PACKAGES_DIR="${PROJECT_DIR}/packages"
 OVERLAY_DIR="${PROJECT_DIR}/overlay"
+ARCHISO_DIR="${ARCHISO_DIR:-arch}"
 SONNET_SRC="${PROJECT_DIR}/sonnet/sonnet"
 VIOLIN_SRC="${PROJECT_DIR}/violin/violin"
 WORK_DIR="${WORK_DIR:-${PROJECT_DIR}/work}"
@@ -52,8 +53,8 @@ check_host_dependencies() {
     local required=(
         bash awk sed grep find sort tail basename dirname date tee
         pacman pacman-key curl tar zstd sha256sum
-        grub-mkrescue mksquashfs xorriso mformat
-        mount umount chroot cp install mkdir rm
+        grub-mkrescue mksquashfs unsquashfs xorriso mformat
+        mount umount chroot cp install mkdir rm stat du
     )
 
     for cmd in "${required[@]}"; do
@@ -210,6 +211,7 @@ copy_project_payload() {
     cp -a "${OVERLAY_DIR}/." "$ROOTFS_DIR/"
     find "${ROOTFS_DIR}/usr/local/bin" -maxdepth 1 -type f -exec chmod 0755 {} + 2>/dev/null || true
     find "${ROOTFS_DIR}/opt/operalinux/debian-coreutils/bin" -maxdepth 1 -type f -exec chmod 0755 {} + 2>/dev/null || true
+    find "${ROOTFS_DIR}/etc/init.d" -maxdepth 1 -type f -exec chmod 0755 {} + 2>/dev/null || true
     install -Dm755 "$SONNET_SRC" "${ROOTFS_DIR}/usr/bin/sonnet"
     install -Dm755 "$VIOLIN_SRC" "${ROOTFS_DIR}/usr/bin/violin"
     install -Dm644 "${CONFIG_DIR}/no-systemd-denylist.txt" "${ROOTFS_DIR}/etc/operalinux/no-systemd-denylist"
@@ -260,6 +262,36 @@ configure_openrc() {
         chroot_run "if [ -x /etc/init.d/${service} ]; then rc-update add '${service}' '${runlevel}'; fi"
     done < "${CONFIG_DIR}/openrc-services.conf"
     chroot_run "passwd -d root >/dev/null 2>&1 || true"
+}
+
+kernel_module_exists() {
+    local kernel_version="$1"
+    local module="$2"
+    find "${ROOTFS_DIR}/usr/lib/modules/${kernel_version}" -type f \
+        \( -name "${module}.ko" -o -name "${module}.ko.*" \) |
+        grep -q .
+}
+
+write_live_mkinitcpio_config() {
+    local kernel_version="$1"
+    local module
+    local modules=(loop squashfs overlay)
+
+    for module in vboxguest vboxvideo; do
+        if kernel_module_exists "$kernel_version" "$module"; then
+            modules+=("$module")
+        else
+            log "WARN" "Kernel module ${module} not found for ${kernel_version}; not adding it to live initramfs"
+        fi
+    done
+
+    cat > "${ROOTFS_DIR}/etc/mkinitcpio-live.conf" <<EOF_MKINITCPIO
+MODULES=(${modules[*]})
+BINARIES=()
+FILES=()
+HOOKS=(base udev modconf block keyboard filesystems archiso)
+COMPRESSION="zstd"
+EOF_MKINITCPIO
 }
 
 purge_systemd_artifacts() {
@@ -341,7 +373,22 @@ configure_initramfs() {
     local kernel_version
     kernel_version="$(find "${ROOTFS_DIR}/usr/lib/modules" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | grep zen | sort -V | tail -n 1 || true)"
     [[ -n "$kernel_version" ]] || die "Could not find an installed linux-zen module directory"
+    write_live_mkinitcpio_config "$kernel_version"
+    chroot_run "mkinitcpio -P"
     chroot_run "mkinitcpio -c /etc/mkinitcpio-live.conf -g /boot/initramfs-linux-zen-live.img -k '${kernel_version}'"
+}
+
+validate_initramfs() {
+    log "INFO" "Validating live initramfs modules"
+    local initramfs="${ROOTFS_DIR}/boot/initramfs-linux-zen-live.img"
+    [[ -s "$initramfs" ]] || die "Live initramfs missing: $initramfs"
+
+    local contents
+    contents="$(chroot "$ROOTFS_DIR" /usr/bin/lsinitcpio /boot/initramfs-linux-zen-live.img)"
+    for module in loop squashfs overlay; do
+        grep -Eq "(^|/)${module}\\.ko(\\.|$)" <<<"$contents" ||
+            die "Live initramfs does not contain required module: ${module}"
+    done
 }
 
 validate_no_systemd() {
@@ -366,7 +413,8 @@ validate_live_users() {
 
 build_iso_tree() {
     log "INFO" "Building ISO tree"
-    mkdir -p "${ISO_DIR}/boot/grub" "${ISO_DIR}/operalinux/${ARCH}"
+    local archiso_tree="${ISO_DIR}/${ARCHISO_DIR}/${ARCH}"
+    mkdir -p "${ISO_DIR}/boot/grub" "$archiso_tree"
     cp "${ROOTFS_DIR}/boot/vmlinuz-linux-zen" "${ISO_DIR}/boot/vmlinuz-linux-zen"
     cp "${ROOTFS_DIR}/boot/initramfs-linux-zen-live.img" "${ISO_DIR}/boot/initramfs-linux-zen-live.img"
     [[ -f "${ROOTFS_DIR}/boot/intel-ucode.img" ]] && cp "${ROOTFS_DIR}/boot/intel-ucode.img" "${ISO_DIR}/boot/intel-ucode.img"
@@ -374,14 +422,46 @@ build_iso_tree() {
 
     sed \
         -e "s/@ISO_LABEL@/${ISO_LABEL}/g" \
+        -e "s/@ARCHISO_DIR@/${ARCHISO_DIR}/g" \
         -e "s/@VERSION@/${VERSION_ID}/g" \
         -e "s/@CODENAME@/${VERSION_CODENAME}/g" \
         "${CONFIG_DIR}/grub.cfg" > "${ISO_DIR}/boot/grub/grub.cfg"
 
-    mksquashfs "$ROOTFS_DIR" "${ISO_DIR}/operalinux/${ARCH}/airootfs.sfs" \
+    mksquashfs "$ROOTFS_DIR" "${archiso_tree}/airootfs.sfs" \
         -noappend -comp zstd -Xcompression-level 19 2>&1 | tee -a "$LOG_FILE"
-    (cd "${ISO_DIR}/operalinux/${ARCH}" && sha256sum airootfs.sfs > airootfs.sfs.sha256)
-    log "INFO" "airootfs.sfs size: $(du -h "${ISO_DIR}/operalinux/${ARCH}/airootfs.sfs" | awk '{print $1}')"
+    unsquashfs -s "${archiso_tree}/airootfs.sfs" 2>&1 | tee -a "$LOG_FILE" >/dev/null
+    (cd "$archiso_tree" && sha256sum airootfs.sfs > airootfs.sfs.sha256)
+    log "INFO" "airootfs.sfs size: $(du -h "${archiso_tree}/airootfs.sfs" | awk '{print $1}')"
+}
+
+validate_iso_tree() {
+    log "INFO" "Validating ISO boot assets and archiso layout"
+    local kernel="${ISO_DIR}/boot/vmlinuz-linux-zen"
+    local initramfs="${ISO_DIR}/boot/initramfs-linux-zen-live.img"
+    local squashfs="${ISO_DIR}/${ARCHISO_DIR}/${ARCH}/airootfs.sfs"
+    local grub_cfg="${ISO_DIR}/boot/grub/grub.cfg"
+
+    [[ -s "$kernel" ]] || die "Missing kernel in ISO tree: $kernel"
+    [[ -s "$initramfs" ]] || die "Missing initramfs in ISO tree: $initramfs"
+    [[ -s "$squashfs" ]] || die "Missing squashfs in ISO tree: $squashfs"
+    [[ "$(stat -c '%u:%g' "$squashfs")" == "0:0" ]] ||
+        die "Squashfs must be owned by root:root: $squashfs"
+    [[ -s "$grub_cfg" ]] || die "Missing GRUB config in ISO tree: $grub_cfg"
+    [[ "$ARCHISO_DIR" == "arch" || "$ARCHISO_DIR" == "archiso" ]] ||
+        die "ARCHISO_DIR must be arch or archiso, got: $ARCHISO_DIR"
+    [[ "$ISO_LABEL" =~ ^[A-Z0-9_]+$ ]] || die "Invalid ISO label: $ISO_LABEL"
+    [[ "${#ISO_LABEL}" -le 32 ]] || die "ISO label is too long for ISO9660: $ISO_LABEL"
+
+    grep -Fq "archisolabel=${ISO_LABEL}" "$grub_cfg" ||
+        die "GRUB archisolabel does not match ISO_LABEL=${ISO_LABEL}"
+    grep -Fq "archisobasedir=${ARCHISO_DIR}" "$grub_cfg" ||
+        die "GRUB archisobasedir does not match ARCHISO_DIR=${ARCHISO_DIR}"
+    grep -Fq -- "--label ${ISO_LABEL}" "$grub_cfg" ||
+        die "GRUB search label does not match ISO_LABEL=${ISO_LABEL}"
+    grep -Fq '@ISO_LABEL@' "$grub_cfg" && die "Unrendered ISO label placeholder remains in GRUB config"
+    grep -Fq '@ARCHISO_DIR@' "$grub_cfg" && die "Unrendered archiso dir placeholder remains in GRUB config"
+    unsquashfs -s "$squashfs" >/dev/null ||
+        die "Invalid squashfs image: $squashfs"
 }
 
 generate_iso() {
@@ -390,6 +470,14 @@ generate_iso() {
     grub-mkrescue -iso-level 3 -volid "$ISO_LABEL" -o "$ISO_PATH" "$ISO_DIR" 2>&1 | tee -a "$LOG_FILE"
     [[ -s "$ISO_PATH" ]] || die "ISO was not created"
     log "INFO" "Built ${ISO_PATH}"
+}
+
+validate_generated_iso() {
+    log "INFO" "Validating generated ISO volume label"
+    if ! xorriso -indev "$ISO_PATH" -pvd_info 2>/dev/null | grep -Fq "Volume Id    : ${ISO_LABEL}"; then
+        rm -f "$ISO_PATH"
+        die "Generated ISO volume label does not match ${ISO_LABEL}"
+    fi
 }
 
 main() {
@@ -409,11 +497,14 @@ main() {
     install_yay
     purge_systemd_artifacts
     configure_initramfs
+    validate_initramfs
     validate_no_systemd
     validate_live_users
     cleanup_mounts
     build_iso_tree
+    validate_iso_tree
     generate_iso
+    validate_generated_iso
 }
 
 main "$@"

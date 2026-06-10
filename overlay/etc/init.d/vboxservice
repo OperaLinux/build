@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+
+description="VirtualBox guest service"
+command="/usr/bin/VBoxService"
+command_args="--foreground"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+    need localmount
+    after modules udev
+}
+
+start_pre() {
+    if [ ! -x "$command" ]; then
+        eerror "VBoxService is not installed"
+        return 1
+    fi
+}
