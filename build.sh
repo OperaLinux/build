@@ -262,6 +262,24 @@ configure_openrc() {
     chroot_run "passwd -d root >/dev/null 2>&1 || true"
 }
 
+purge_systemd_artifacts() {
+    log "INFO" "Removing packaged systemd units and runtime directories"
+    local path
+    local paths=(
+        "${ROOTFS_DIR}/etc/systemd"
+        "${ROOTFS_DIR}/run/systemd"
+        "${ROOTFS_DIR}/usr/lib/systemd"
+        "${ROOTFS_DIR}/usr/share/systemd"
+        "${ROOTFS_DIR}/var/lib/systemd"
+    )
+
+    for path in "${paths[@]}"; do
+        if [[ -e "$path" ]]; then
+            rm -rf "$path"
+        fi
+    done
+}
+
 install_proton_ge() {
     if [[ "${INSTALL_PROTON_GE:-1}" != "1" ]]; then
         log "INFO" "Skipping Proton GE install because INSTALL_PROTON_GE is not 1"
@@ -388,6 +406,7 @@ main() {
     configure_openrc
     install_proton_ge
     install_yay
+    purge_systemd_artifacts
     configure_initramfs
     validate_no_systemd
     validate_live_users
