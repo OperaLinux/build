@@ -25,7 +25,7 @@ sudo ./build.sh
 The final ISO is written to:
 
 ```text
-output/OperaLinux-x86_64.iso
+output/OperaLinux-1.0.0-lynx-x86_64.iso
 ```
 
 By default the build downloads and installs the latest Proton GE release into

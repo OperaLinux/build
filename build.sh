@@ -17,12 +17,12 @@ OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/output}"
 LOG_DIR="${LOG_DIR:-${PROJECT_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/build.log}"
 BUILD_PACMAN_CONF="${WORK_DIR}/pacman-build.conf"
-ISO_NAME="OperaLinux-x86_64.iso"
-ISO_PATH="${OUTPUT_DIR}/${ISO_NAME}"
 
 # shellcheck source=/dev/null
 source "${CONFIG_DIR}/release.conf"
 
+ISO_NAME="${ISO_NAME:-${NAME}-${VERSION_ID}-${VERSION_CODENAME}-${ARCH}.iso}"
+ISO_PATH="${OUTPUT_DIR}/${ISO_NAME}"
 ISO_LABEL="OPERALINUX_${VERSION_ID//./}"
 
 log() {

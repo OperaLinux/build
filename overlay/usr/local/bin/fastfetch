@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+config="/etc/fastfetch/config.jsonc"
+
+if [[ -r "$config" ]]; then
+    exec /usr/bin/fastfetch --config "$config" "$@"
+fi
+
+exec /usr/bin/fastfetch "$@"

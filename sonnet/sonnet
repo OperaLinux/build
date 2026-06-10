@@ -65,51 +65,106 @@ ask() {
     local default="${2:-}"
     local reply
     if [[ -n "$default" ]]; then
-        read -r -p "${prompt} [${default}]: " reply
+        read -r -p "${prompt} [${default}]: " reply </dev/tty
         printf '%s' "${reply:-$default}"
     else
-        read -r -p "${prompt}: " reply
+        read -r -p "${prompt}: " reply </dev/tty
         printf '%s' "$reply"
     fi
 }
 
 confirm_install() {
-    printf '\nWARNING: This can permanently erase selected disk data.\n'
-    printf 'To continue, type exactly: %s\n' "$CONFIRM_PHRASE"
+    printf '\nWARNING: This can permanently erase selected disk data.\n' >&2
+    if [[ "$#" -gt 0 ]]; then
+        printf 'Selected plan:\n' >&2
+        local item
+        for item in "$@"; do
+            printf '  - %s\n' "$item" >&2
+        done
+    fi
+    printf 'To continue, type exactly: %s\n' "$CONFIRM_PHRASE" >&2
     local reply
-    read -r -p '> ' reply
+    read -r -p '> ' reply </dev/tty
     [[ "$reply" == "$CONFIRM_PHRASE" ]] || die "Confirmation phrase did not match; aborting"
 }
 
 list_disks() {
-    log "Available disks:"
-    lsblk -dpno NAME,SIZE,MODEL,TYPE | awk '$4 == "disk" { printf "  %s  %s  %s\n", $1, $2, $3 }'
+    printf 'Available disks:\n' >&2
+    lsblk -dpno NAME,SIZE,MODEL,TYPE |
+        awk '$NF == "disk" { type = $NF; $NF = ""; sub(/[[:space:]]+$/, ""); printf "  %s\n", $0 }' >&2
 }
 
 select_disk() {
-    list_disks
-    local disk
-    disk="$(ask "Target disk, for example /dev/nvme0n1")"
-    [[ -b "$disk" ]] || die "Not a block device: $disk"
-    [[ "$(lsblk -dnro TYPE "$disk")" == "disk" ]] || die "Target must be a whole disk"
-    printf '%s' "$disk"
+    local prompt="${1:-Target disk number or path}"
+    local disks=()
+    local disk choice default
+    while IFS= read -r disk; do
+        disks+=("$disk")
+    done < <(lsblk -dpno NAME,TYPE | awk '$2 == "disk" {print $1}')
+
+    [[ "${#disks[@]}" -gt 0 ]] || die "No installable disks found"
+    default="${disks[0]}"
+
+    while true; do
+        printf '\nAvailable disks:\n' >&2
+        local index=1
+        for disk in "${disks[@]}"; do
+            printf '  %d) %s\n' "$index" "$(lsblk -dpno NAME,SIZE,MODEL "$disk" | sed 's/[[:space:]]\+/ /g')" >&2
+            index=$((index + 1))
+        done
+        choice="$(ask "$prompt" "1")"
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#disks[@]} )); then
+            disk="${disks[choice - 1]}"
+        elif [[ -n "$choice" ]]; then
+            disk="$choice"
+        else
+            disk="$default"
+        fi
+        [[ -b "$disk" ]] || {
+            printf 'Not a block device: %s\n' "$disk" >&2
+            continue
+        }
+        [[ "$(lsblk -dnro TYPE "$disk")" == "disk" ]] || {
+            printf 'Target must be a whole disk: %s\n' "$disk" >&2
+            continue
+        }
+        printf '%s' "$disk"
+        return
+    done
 }
 
 select_boot_mode() {
     local default="bios"
     [[ -d /sys/firmware/efi ]] && default="uefi"
     local mode
-    mode="$(ask "Boot mode: uefi or bios" "$default")"
-    case "$mode" in
-        uefi|bios) printf '%s' "$mode" ;;
-        *) die "Boot mode must be uefi or bios" ;;
-    esac
+    while true; do
+        printf '\nBoot mode:\n  1) UEFI\n  2) BIOS/Legacy\n' >&2
+        mode="$(ask "Boot mode" "$default")"
+        case "$mode" in
+            1|uefi|UEFI) printf 'uefi'; return ;;
+            2|bios|BIOS|legacy|Legacy) printf 'bios'; return ;;
+            *) printf 'Choose 1/uefi or 2/bios.\n' >&2 ;;
+        esac
+    done
+}
+
+select_partition_mode() {
+    local mode
+    while true; do
+        printf '\nPartition mode:\n  1) Automatic erase and install\n  2) Manual, use existing partitions\n' >&2
+        mode="$(ask "Partition mode" "auto")"
+        case "$mode" in
+            1|auto|automatic) printf 'auto'; return ;;
+            2|manual) printf 'manual'; return ;;
+            *) printf 'Choose 1/auto or 2/manual.\n' >&2 ;;
+        esac
+    done
 }
 
 auto_partition() {
     local disk="$1"
     local mode="$2"
-    confirm_install
+    confirm_install "Target disk: ${disk}" "Boot mode: ${mode}" "Partitioning: automatic erase and install"
 
     log "Partitioning $disk for $mode"
     swapoff -a || true
@@ -135,7 +190,7 @@ auto_partition() {
 
 manual_partition() {
     local mode="$1"
-    printf '\nManual mode expects partitions to already exist.\n'
+    printf '\nManual mode expects partitions to already exist.\n' >&2
     ROOT_PART="$(ask "Root partition")"
     [[ -b "$ROOT_PART" ]] || die "Root partition not found: $ROOT_PART"
     EFI_PART=""
@@ -143,7 +198,11 @@ manual_partition() {
         EFI_PART="$(ask "EFI system partition")"
         [[ -b "$EFI_PART" ]] || die "EFI partition not found: $EFI_PART"
     fi
-    confirm_install
+    if [[ -n "$EFI_PART" ]]; then
+        confirm_install "Root partition: ${ROOT_PART}" "EFI partition: ${EFI_PART}" "Boot mode: ${mode}" "Partitioning: manual; selected partitions will be formatted"
+    else
+        confirm_install "Root partition: ${ROOT_PART}" "Boot mode: ${mode}" "Partitioning: manual; selected partitions will be formatted"
+    fi
 }
 
 format_and_mount() {
@@ -399,7 +458,7 @@ main() {
 
     local boot_mode install_mode disk
     boot_mode="$(select_boot_mode)"
-    install_mode="$(ask "Partition mode: auto or manual" "auto")"
+    install_mode="$(select_partition_mode)"
 
     case "$install_mode" in
         auto)
@@ -407,8 +466,7 @@ main() {
             auto_partition "$disk" "$boot_mode"
             ;;
         manual)
-            disk="$(ask "Whole disk for bootloader install")"
-            [[ -b "$disk" ]] || die "Disk not found: $disk"
+            disk="$(select_disk "Whole bootloader disk number or path")"
             manual_partition "$boot_mode"
             ;;
         *)
