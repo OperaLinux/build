@@ -1,5 +1,5 @@
 arch-install-scripts
 dosfstools
+libisoburn
 mtools
 squashfs-tools
-xorriso

@@ -166,7 +166,7 @@ install_base_system() {
     local packages=(
         base base-devel linux-zen linux-zen-headers linux-firmware
         amd-ucode intel-ucode mkinitcpio grub efibootmgr os-prober
-        openrc openrc-system eudev eudev-openrc elogind elogind-openrc
+        openrc udev elogind elogind-openrc
         dbus dbus-openrc networkmanager networkmanager-openrc
         sudo bash pacman artix-keyring artix-mirrorlist
         artix-archlinux-support archlinux-keyring

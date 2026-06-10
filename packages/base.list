@@ -12,8 +12,6 @@ dkms
 efibootmgr
 elogind
 elogind-openrc
-eudev
-eudev-openrc
 fastfetch
 filesystem
 git
@@ -28,7 +26,6 @@ mkinitcpio
 mkinitcpio-archiso
 nano
 openrc
-openrc-system
 os-prober
 pacman
 rsync
@@ -38,4 +35,5 @@ unzip
 vim
 wget
 xz
+udev
 zstd

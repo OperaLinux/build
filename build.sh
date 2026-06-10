@@ -65,6 +65,16 @@ check_host_dependencies() {
     fi
 }
 
+clean_pacman_keyring_sockets() {
+    local keyring_dir="/etc/pacman.d/gnupg"
+    [[ -d "$keyring_dir" ]] || return 0
+    log "INFO" "Cleaning pacman keyring runtime sockets before rootfs bootstrap"
+    if have gpgconf; then
+        gpgconf --homedir "$keyring_dir" --kill all >/dev/null 2>&1 || true
+    fi
+    find "$keyring_dir" -maxdepth 1 -type s -name 'S.gpg-agent*' -delete 2>/dev/null || true
+}
+
 cleanup_mounts() {
     local mountpoint
     for mountpoint in \
@@ -321,6 +331,7 @@ main() {
     check_requested_packages
     prepare_workspace
     write_build_pacman_conf
+    clean_pacman_keyring_sockets
     install_rootfs
     mount_api_filesystems
     copy_pacman_configuration
