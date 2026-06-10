@@ -15,6 +15,7 @@ ISO_DIR="${ISO_DIR:-${WORK_DIR}/iso}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_DIR}/output}"
 LOG_DIR="${LOG_DIR:-${PROJECT_DIR}/logs}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/build.log}"
+BUILD_PACMAN_CONF="${WORK_DIR}/pacman-build.conf"
 ISO_NAME="OperaLinux-x86_64.iso"
 ISO_PATH="${OUTPUT_DIR}/${ISO_NAME}"
 
@@ -90,6 +91,22 @@ prepare_workspace() {
     : > "$LOG_FILE"
 }
 
+write_build_pacman_conf() {
+    log "INFO" "Writing build-local pacman configuration"
+    awk -v artix_mirror="${CONFIG_DIR}/pacman.d/mirrorlist" \
+        -v arch_mirror="${CONFIG_DIR}/pacman.d/mirrorlist-arch" '
+        $0 ~ /^[[:space:]]*Include[[:space:]]*=[[:space:]]*\/etc\/pacman\.d\/mirrorlist[[:space:]]*$/ {
+            print "Include = " artix_mirror
+            next
+        }
+        $0 ~ /^[[:space:]]*Include[[:space:]]*=[[:space:]]*\/etc\/pacman\.d\/mirrorlist-arch[[:space:]]*$/ {
+            print "Include = " arch_mirror
+            next
+        }
+        { print }
+    ' "${CONFIG_DIR}/pacman.conf" > "$BUILD_PACMAN_CONF"
+}
+
 read_package_files() {
     awk '
         /^[[:space:]]*($|#)/ { next }
@@ -133,9 +150,9 @@ install_rootfs() {
     mapfile -t package_list < <(read_package_files "${PACKAGES_DIR}"/*.list)
 
     if have basestrap; then
-        basestrap -C "${CONFIG_DIR}/pacman.conf" "$ROOTFS_DIR" "${package_list[@]}" 2>&1 | tee -a "$LOG_FILE"
+        basestrap -C "$BUILD_PACMAN_CONF" "$ROOTFS_DIR" "${package_list[@]}" 2>&1 | tee -a "$LOG_FILE"
     else
-        pacstrap -C "${CONFIG_DIR}/pacman.conf" "$ROOTFS_DIR" "${package_list[@]}" 2>&1 | tee -a "$LOG_FILE"
+        pacstrap -C "$BUILD_PACMAN_CONF" "$ROOTFS_DIR" "${package_list[@]}" 2>&1 | tee -a "$LOG_FILE"
     fi
 }
 
@@ -303,6 +320,7 @@ main() {
     check_host_dependencies
     check_requested_packages
     prepare_workspace
+    write_build_pacman_conf
     install_rootfs
     mount_api_filesystems
     copy_pacman_configuration
