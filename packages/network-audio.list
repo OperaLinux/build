@@ -1,0 +1,17 @@
+alsa-plugins
+bind
+dhcpcd
+dhcpcd-openrc
+ethtool
+iwd
+modemmanager
+networkmanager
+networkmanager-openrc
+pipewire
+pipewire-alsa
+pipewire-jack
+pipewire-pulse
+usb_modeswitch
+wireguard-tools
+wireplumber
+wpa_supplicant

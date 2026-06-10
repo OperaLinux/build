@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_FILE="/var/log/sonnet-install.log"
+TARGET_MOUNT="/mnt"
+CONFIRM_PHRASE="INSTALL OPERALINUX"
+RELEASE_NAME="OperaLinux"
+RELEASE_VERSION="1.0.0"
+RELEASE_CODENAME="lynx"
+
+mkdir -p "$(dirname "$LOG_FILE")"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log() {
+    printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
+}
+
+die() {
+    log "ERROR: $*"
+    exit 1
+}
+
+need_root() {
+    [[ "${EUID}" -eq 0 ]] || die "Run sonnet as root"
+}
+
+have() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+need() {
+    have "$1" || die "Missing required command: $1"
+}
+
+installer_cmd() {
+    if have basestrap; then
+        printf 'basestrap'
+    elif have pacstrap; then
+        printf 'pacstrap'
+    else
+        die "Need basestrap or pacstrap"
+    fi
+}
+
+chroot_run() {
+    chroot "$TARGET_MOUNT" /usr/bin/env -i \
+        HOME=/root \
+        TERM="${TERM:-linux}" \
+        PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin \
+        /bin/bash -lc "$*"
+}
+
+part_name() {
+    local disk="$1"
+    local number="$2"
+    if [[ "$disk" =~ (nvme|mmcblk|loop) ]]; then
+        printf '%sp%s' "$disk" "$number"
+    else
+        printf '%s%s' "$disk" "$number"
+    fi
+}
+
+ask() {
+    local prompt="$1"
+    local default="${2:-}"
+    local reply
+    if [[ -n "$default" ]]; then
+        read -r -p "${prompt} [${default}]: " reply
+        printf '%s' "${reply:-$default}"
+    else
+        read -r -p "${prompt}: " reply
+        printf '%s' "$reply"
+    fi
+}
+
+confirm_install() {
+    printf '\nWARNING: This can permanently erase selected disk data.\n'
+    printf 'To continue, type exactly: %s\n' "$CONFIRM_PHRASE"
+    local reply
+    read -r -p '> ' reply
+    [[ "$reply" == "$CONFIRM_PHRASE" ]] || die "Confirmation phrase did not match; aborting"
+}
+
+list_disks() {
+    log "Available disks:"
+    lsblk -dpno NAME,SIZE,MODEL,TYPE | awk '$4 == "disk" { printf "  %s  %s  %s\n", $1, $2, $3 }'
+}
+
+select_disk() {
+    list_disks
+    local disk
+    disk="$(ask "Target disk, for example /dev/nvme0n1")"
+    [[ -b "$disk" ]] || die "Not a block device: $disk"
+    [[ "$(lsblk -dnro TYPE "$disk")" == "disk" ]] || die "Target must be a whole disk"
+    printf '%s' "$disk"
+}
+
+select_boot_mode() {
+    local default="bios"
+    [[ -d /sys/firmware/efi ]] && default="uefi"
+    local mode
+    mode="$(ask "Boot mode: uefi or bios" "$default")"
+    case "$mode" in
+        uefi|bios) printf '%s' "$mode" ;;
+        *) die "Boot mode must be uefi or bios" ;;
+    esac
+}
+
+auto_partition() {
+    local disk="$1"
+    local mode="$2"
+    confirm_install
+
+    log "Partitioning $disk for $mode"
+    swapoff -a || true
+    umount -R "$TARGET_MOUNT" 2>/dev/null || true
+    wipefs -af "$disk"
+    sgdisk --zap-all "$disk"
+
+    if [[ "$mode" == "uefi" ]]; then
+        sgdisk -n 1:1MiB:+1024MiB -t 1:ef00 -c 1:OPERA_EFI "$disk"
+        sgdisk -n 2:0:0 -t 2:8304 -c 2:OPERA_ROOT "$disk"
+        EFI_PART="$(part_name "$disk" 1)"
+        ROOT_PART="$(part_name "$disk" 2)"
+    else
+        sgdisk -n 1:1MiB:+2MiB -t 1:ef02 -c 1:OPERA_BIOS "$disk"
+        sgdisk -n 2:0:0 -t 2:8304 -c 2:OPERA_ROOT "$disk"
+        EFI_PART=""
+        ROOT_PART="$(part_name "$disk" 2)"
+    fi
+
+    partprobe "$disk" || true
+    udevadm settle || true
+}
+
+manual_partition() {
+    local mode="$1"
+    printf '\nManual mode expects partitions to already exist.\n'
+    ROOT_PART="$(ask "Root partition")"
+    [[ -b "$ROOT_PART" ]] || die "Root partition not found: $ROOT_PART"
+    EFI_PART=""
+    if [[ "$mode" == "uefi" ]]; then
+        EFI_PART="$(ask "EFI system partition")"
+        [[ -b "$EFI_PART" ]] || die "EFI partition not found: $EFI_PART"
+    fi
+    confirm_install
+}
+
+format_and_mount() {
+    log "Formatting and mounting target"
+    mkfs.ext4 -F -L OPERA_ROOT "$ROOT_PART"
+    mkdir -p "$TARGET_MOUNT"
+    mount "$ROOT_PART" "$TARGET_MOUNT"
+
+    if [[ -n "${EFI_PART:-}" ]]; then
+        mkfs.vfat -F32 -n OPERA_EFI "$EFI_PART"
+        mkdir -p "$TARGET_MOUNT/boot/efi"
+        mount "$EFI_PART" "$TARGET_MOUNT/boot/efi"
+    fi
+}
+
+install_base_system() {
+    log "Installing base system"
+    local installer
+    installer="$(installer_cmd)"
+    local packages=(
+        base base-devel linux-zen linux-zen-headers linux-firmware
+        amd-ucode intel-ucode mkinitcpio grub efibootmgr os-prober
+        openrc openrc-system eudev eudev-openrc elogind elogind-openrc
+        dbus dbus-openrc networkmanager networkmanager-openrc
+        sudo bash pacman artix-keyring artix-mirrorlist
+        artix-archlinux-support archlinux-keyring
+        fastfetch nano vim git curl wget jq zstd tar
+        pipewire pipewire-alsa pipewire-pulse wireplumber alsa-utils
+    )
+    "$installer" "$TARGET_MOUNT" "${packages[@]}"
+
+    genfstab -U "$TARGET_MOUNT" > "$TARGET_MOUNT/etc/fstab"
+}
+
+copy_live_tools() {
+    log "Copying OperaLinux tools"
+    install -Dm755 /usr/bin/sonnet "$TARGET_MOUNT/usr/bin/sonnet" 2>/dev/null || true
+    install -Dm755 /usr/bin/violin "$TARGET_MOUNT/usr/bin/violin" 2>/dev/null || true
+    install -Dm755 /usr/bin/yay "$TARGET_MOUNT/usr/bin/yay" 2>/dev/null || true
+    install -Dm755 /usr/local/bin/update-proton-ge "$TARGET_MOUNT/usr/local/bin/update-proton-ge" 2>/dev/null || true
+    install -Dm755 /usr/local/bin/operalinux-nvidia-driver "$TARGET_MOUNT/usr/local/bin/operalinux-nvidia-driver" 2>/dev/null || true
+    install -Dm755 /usr/local/bin/operalinux-no-systemd-guard "$TARGET_MOUNT/usr/local/bin/operalinux-no-systemd-guard" 2>/dev/null || true
+    install -Dm755 /usr/local/bin/yay "$TARGET_MOUNT/usr/local/bin/yay" 2>/dev/null || true
+    install -Dm644 /etc/pacman.conf "$TARGET_MOUNT/etc/pacman.conf" 2>/dev/null || true
+    install -Dm644 /etc/pacman.d/mirrorlist "$TARGET_MOUNT/etc/pacman.d/mirrorlist" 2>/dev/null || true
+    install -Dm644 /etc/pacman.d/mirrorlist-arch "$TARGET_MOUNT/etc/pacman.d/mirrorlist-arch" 2>/dev/null || true
+    install -Dm644 /etc/pacman.d/hooks/no-systemd.hook "$TARGET_MOUNT/etc/pacman.d/hooks/no-systemd.hook" 2>/dev/null || true
+    install -Dm644 /etc/operalinux/no-systemd-denylist "$TARGET_MOUNT/etc/operalinux/no-systemd-denylist" 2>/dev/null || true
+    install -Dm644 /etc/violin.conf "$TARGET_MOUNT/etc/violin.conf" 2>/dev/null || true
+    install -Dm644 /etc/fastfetch/config.jsonc "$TARGET_MOUNT/etc/fastfetch/config.jsonc" 2>/dev/null || true
+    install -Dm644 /etc/profile.d/operalinux-prompt.sh "$TARGET_MOUNT/etc/profile.d/operalinux-prompt.sh" 2>/dev/null || true
+    if [[ -d /etc/operalinux ]]; then
+        mkdir -p "$TARGET_MOUNT/etc"
+        cp -a /etc/operalinux "$TARGET_MOUNT/etc/"
+    fi
+    if [[ -d /opt/operalinux/debian-coreutils ]]; then
+        mkdir -p "$TARGET_MOUNT/opt/operalinux"
+        cp -a /opt/operalinux/debian-coreutils "$TARGET_MOUNT/opt/operalinux/"
+    fi
+    if [[ -d /usr/share/operalinux ]]; then
+        mkdir -p "$TARGET_MOUNT/usr/share"
+        cp -a /usr/share/operalinux "$TARGET_MOUNT/usr/share/"
+    fi
+}
+
+safe_resource_name() {
+    local value="$1"
+    [[ "$value" =~ ^[A-Za-z0-9_./@+-]+$ ]] || return 1
+    [[ "$value" != /* ]] || return 1
+    [[ "$value" != *..* ]] || return 1
+}
+
+choose_hostname() {
+    local hostname
+    while true; do
+        read -r -p "Hostname [operalinux]: " hostname
+        hostname="${hostname:-operalinux}"
+        if [[ "$hostname" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,62}$ ]]; then
+            printf '%s' "$hostname"
+            return
+        fi
+        printf 'Hostname non valido. Usa lettere, numeri e trattini; niente spazi.\n' >&2
+    done
+}
+
+choose_timezone() {
+    local timezone pattern
+    printf '\nTimezone: scrivi il valore completo, oppure ? per cercare.\n' >&2
+    printf 'Esempi: Europe/Rome, Europe/San_Marino, UTC\n' >&2
+    while true; do
+        read -r -p "Timezone [UTC]: " timezone
+        timezone="${timezone:-UTC}"
+        if [[ "$timezone" == "?" ]]; then
+            read -r -p "Cerca timezone: " pattern
+            find "$TARGET_MOUNT/usr/share/zoneinfo" -type f \
+                ! -path '*/posix/*' ! -path '*/right/*' \
+                -printf '%P\n' | grep -Fi -- "$pattern" | sort | sed -n '1,40p' >&2 || true
+            continue
+        fi
+        if safe_resource_name "$timezone" && [[ -f "$TARGET_MOUNT/usr/share/zoneinfo/$timezone" ]]; then
+            printf '%s' "$timezone"
+            return
+        fi
+        printf 'Timezone non valida o non trovata: %s\n' "$timezone" >&2
+    done
+}
+
+available_locales() {
+    sed -n 's/^#\?\([A-Za-z0-9_.@-]\{1,\}[[:space:]]\+UTF-8\)$/\1/p' "$TARGET_MOUNT/etc/locale.gen" |
+        awk '{print $1}' | sort -u
+}
+
+choose_locale() {
+    local locale pattern
+    printf '\nLocale: scrivi il valore completo, oppure ? per cercare.\n' >&2
+    printf 'Esempi: en_US.UTF-8, it_IT.UTF-8\n' >&2
+    while true; do
+        read -r -p "Locale [en_US.UTF-8]: " locale
+        locale="${locale:-en_US.UTF-8}"
+        if [[ "$locale" == "?" ]]; then
+            read -r -p "Cerca locale: " pattern
+            available_locales | grep -Fi -- "$pattern" | sed -n '1,40p' >&2 || true
+            continue
+        fi
+        if available_locales | grep -Fxq "$locale"; then
+            printf '%s' "$locale"
+            return
+        fi
+        printf 'Locale non valida o non trovata: %s\n' "$locale" >&2
+    done
+}
+
+available_keymaps() {
+    find "$TARGET_MOUNT/usr/share/kbd/keymaps" -type f \( -name '*.map' -o -name '*.map.gz' \) -printf '%f\n' |
+        sed -E 's/\.map(\.gz)?$//' | sort -u
+}
+
+choose_keymap() {
+    local keymap pattern
+    printf '\nKeyboard keymap: scrivi il nome, oppure ? per cercare.\n' >&2
+    printf 'Esempi: us, it, de, fr\n' >&2
+    while true; do
+        read -r -p "Keyboard keymap [us]: " keymap
+        keymap="${keymap:-us}"
+        if [[ "$keymap" == "?" ]]; then
+            read -r -p "Cerca keymap: " pattern
+            available_keymaps | grep -Fi -- "$pattern" | sed -n '1,40p' >&2 || true
+            continue
+        fi
+        if available_keymaps | grep -Fxq "$keymap"; then
+            printf '%s' "$keymap"
+            return
+        fi
+        printf 'Keymap non valida o non trovata: %s\n' "$keymap" >&2
+    done
+}
+
+enable_locale() {
+    local locale="$1"
+    local escaped
+    escaped="$(printf '%s' "$locale" | sed 's/[][\/.^$*+?{}()|\\]/\\&/g')"
+    sed -i "s/^#\(${escaped}[[:space:]]\+UTF-8\)/\1/" "$TARGET_MOUNT/etc/locale.gen"
+}
+
+configure_identity() {
+    local hostname timezone locale keymap
+    hostname="$(choose_hostname)"
+    timezone="$(choose_timezone)"
+    locale="$(choose_locale)"
+    keymap="$(choose_keymap)"
+
+    printf '%s\n' "$hostname" > "$TARGET_MOUNT/etc/hostname"
+    cat > "$TARGET_MOUNT/etc/os-release" <<EOF_OS
+NAME="${RELEASE_NAME}"
+PRETTY_NAME="${RELEASE_NAME} ${RELEASE_VERSION} ${RELEASE_CODENAME}"
+ID=operalinux
+ID_LIKE="artix arch"
+VERSION="${RELEASE_VERSION} ${RELEASE_CODENAME}"
+VERSION_ID="${RELEASE_VERSION}"
+VERSION_CODENAME="${RELEASE_CODENAME}"
+ANSI_COLOR="1;36"
+EOF_OS
+
+    chroot_run "ln -sf '/usr/share/zoneinfo/${timezone}' /etc/localtime || true"
+    chroot_run "hwclock --systohc || true"
+    enable_locale "$locale"
+    chroot_run "locale-gen"
+    printf 'LANG=%s\n' "$locale" > "$TARGET_MOUNT/etc/locale.conf"
+    printf 'KEYMAP=%s\n' "$keymap" > "$TARGET_MOUNT/etc/vconsole.conf"
+}
+
+configure_users() {
+    log "Set root password"
+    chroot_run "passwd"
+
+    sed -i 's/^# %wheel ALL=(ALL:ALL) ALL/%wheel ALL=(ALL:ALL) ALL/' "$TARGET_MOUNT/etc/sudoers" || true
+
+    while true; do
+        local user
+        user="$(ask "Create user (blank to finish)")"
+        [[ -z "$user" ]] && break
+        [[ "$user" =~ ^[a-z_][a-z0-9_-]*$ ]] || {
+            printf 'Invalid user name.\n' >&2
+            continue
+        }
+        chroot_run "useradd -m -G wheel,audio,video,input,storage,optical -s /bin/bash '$user'"
+        log "Set password for $user"
+        chroot_run "passwd '$user'"
+    done
+}
+
+configure_openrc() {
+    log "Enabling OpenRC services"
+    local services=(
+        "devfs sysinit"
+        "dmesg sysinit"
+        "udev sysinit"
+        "udev-trigger sysinit"
+        "dbus default"
+        "elogind boot"
+        "NetworkManager default"
+    )
+    local entry service runlevel
+    for entry in "${services[@]}"; do
+        service="${entry% *}"
+        runlevel="${entry#* }"
+        chroot_run "if [ -x /etc/init.d/${service} ]; then rc-update add '${service}' '${runlevel}'; fi"
+    done
+}
+
+install_grub() {
+    local disk="$1"
+    local mode="$2"
+    log "Installing GRUB for $mode"
+    if [[ "$mode" == "uefi" ]]; then
+        chroot_run "grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=OperaLinux --removable --recheck"
+    else
+        chroot_run "grub-install --target=i386-pc --recheck '$disk'"
+    fi
+    chroot_run "mkinitcpio -P"
+    chroot_run "grub-mkconfig -o /boot/grub/grub.cfg"
+}
+
+main() {
+    need_root
+    for cmd in lsblk awk wipefs sgdisk partprobe mkfs.ext4 mount genfstab chroot passwd; do
+        need "$cmd"
+    done
+    have mkfs.vfat || log "mkfs.vfat is needed for UEFI installs"
+
+    printf 'Sonnet OperaLinux installer\n'
+    printf 'Log: %s\n\n' "$LOG_FILE"
+
+    local boot_mode install_mode disk
+    boot_mode="$(select_boot_mode)"
+    install_mode="$(ask "Partition mode: auto or manual" "auto")"
+
+    case "$install_mode" in
+        auto)
+            disk="$(select_disk)"
+            auto_partition "$disk" "$boot_mode"
+            ;;
+        manual)
+            disk="$(ask "Whole disk for bootloader install")"
+            [[ -b "$disk" ]] || die "Disk not found: $disk"
+            manual_partition "$boot_mode"
+            ;;
+        *)
+            die "Partition mode must be auto or manual"
+            ;;
+    esac
+
+    format_and_mount
+    install_base_system
+    copy_live_tools
+    configure_identity
+    configure_users
+    configure_openrc
+    install_grub "$disk" "$boot_mode"
+
+    log "OperaLinux installation complete. Reboot when ready."
+}
+
+main "$@"

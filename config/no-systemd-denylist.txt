@@ -1,0 +1,7 @@
+systemd
+systemd-libs
+systemd-sysvcompat
+systemd-resolvconf
+systemd-ukify
+systemd-openrc
+libsystemd

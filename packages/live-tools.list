@@ -1,0 +1,5 @@
+arch-install-scripts
+dosfstools
+mtools
+squashfs-tools
+xorriso

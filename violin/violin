@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="${VIOLIN_CONFIG:-/etc/violin.conf}"
+DB_DIR="/var/lib/violin"
+CACHE_DIR="/var/cache/violin"
+LOG_FILE="/var/log/violin.log"
+SYSTEM_LOG_FILE="/var/log/violin-system-upgrade.log"
+REPOSITORY_URL="https://raw.githubusercontent.com/OperaLinux/void/main"
+RELEASES_URL="https://raw.githubusercontent.com/OperaLinux/update/main"
+SNAPSHOT_KEEP=3
+
+if [[ -r "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
+
+INSTALLED_DIR="${DB_DIR}/installed"
+SNAPSHOT_DIR="${DB_DIR}/snapshots"
+INDEX_FILE="${DB_DIR}/index.json"
+
+log_msg() {
+    local log_file="$1"
+    shift
+    mkdir -p "$(dirname "$log_file")"
+    printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" | tee -a "$log_file"
+}
+
+die() {
+    log_msg "$LOG_FILE" "ERROR: $*"
+    exit 1
+}
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+need_root() {
+    [[ "${EUID}" -eq 0 ]] || die "This command requires root"
+}
+
+init_dirs() {
+    mkdir -p "$DB_DIR" "$CACHE_DIR" "$INSTALLED_DIR" "$SNAPSHOT_DIR"
+}
+
+fetch_url() {
+    local url="$1"
+    local dest="$2"
+    case "$url" in
+        file://*)
+            cp "${url#file://}" "$dest"
+            ;;
+        /*)
+            cp "$url" "$dest"
+            ;;
+        http://*|https://*)
+            curl -fL "$url" -o "$dest"
+            ;;
+        *)
+            cp "$url" "$dest"
+            ;;
+    esac
+}
+
+join_url() {
+    local base="${1%/}"
+    local path="${2#/}"
+    printf '%s/%s' "$base" "$path"
+}
+
+ensure_index() {
+    if [[ ! -s "$INDEX_FILE" ]]; then
+        violin_update
+    fi
+}
+
+violin_update() {
+    need jq
+    init_dirs
+    local tmp="${CACHE_DIR}/index.json.tmp"
+    fetch_url "$(join_url "$REPOSITORY_URL" "index.json")" "$tmp"
+    jq empty "$tmp"
+    mv "$tmp" "$INDEX_FILE"
+    log_msg "$LOG_FILE" "Repository index updated"
+}
+
+package_json() {
+    local name="$1"
+    jq -er --arg name "$name" '.packages[] | select(.name == $name)' "$INDEX_FILE"
+}
+
+package_field() {
+    local name="$1"
+    local field="$2"
+    package_json "$name" | jq -er "$field"
+}
+
+is_installed() {
+    [[ -d "${INSTALLED_DIR}/$1" ]]
+}
+
+download_package() {
+    local name="$1"
+    local url sha archive
+    url="$(package_field "$name" '.url')"
+    sha="$(package_field "$name" '.sha256')"
+    archive="${CACHE_DIR}/${url##*/}"
+    [[ "$url" == http* || "$url" == file:* || "$url" == /* ]] || url="$(join_url "$REPOSITORY_URL" "$url")"
+    fetch_url "$url" "$archive"
+    printf '%s  %s\n' "$sha" "$archive" | sha256sum -c - >/dev/null
+    printf '%s' "$archive"
+}
+
+install_archive() {
+    local name="$1"
+    local archive="$2"
+    local tmp backup_dir pkg_db
+    tmp="$(mktemp -d)"
+    backup_dir="${DB_DIR}/rollback/${name}-$(date -u '+%Y%m%d%H%M%S')"
+    pkg_db="${INSTALLED_DIR}/${name}"
+    mkdir -p "$backup_dir"
+
+    tar -xaf "$archive" -C "$tmp"
+    [[ -f "$tmp/metadata.json" ]] || die "Package $name has no metadata.json"
+
+    local dep pacdep
+    while read -r dep; do
+        [[ -n "$dep" ]] && install_package "$dep"
+    done < <(jq -r '.dependencies[]?' "$tmp/metadata.json")
+
+    mapfile -t pacdeps < <(jq -r '.pacman_dependencies[]?' "$tmp/metadata.json")
+    if [[ "${#pacdeps[@]}" -gt 0 ]]; then
+        pacman -S --needed --noconfirm "${pacdeps[@]}"
+    fi
+
+    if [[ -d "$tmp/files" ]]; then
+        mkdir -p "$backup_dir/files"
+        while IFS= read -r rel; do
+            rel="${rel#./}"
+            if [[ -e "/$rel" ]]; then
+                mkdir -p "$backup_dir/files/$(dirname "$rel")"
+                cp -a "/$rel" "$backup_dir/files/$rel"
+            fi
+        done < <(cd "$tmp/files" && find . -type f -o -type l)
+        tar -C "$tmp/files" -cpf - . | tar -C / -xpf -
+    fi
+
+    if [[ -x "$tmp/install.sh" ]]; then
+        (cd "$tmp" && bash ./install.sh)
+    fi
+
+    mkdir -p "$pkg_db"
+    cp "$tmp/metadata.json" "$pkg_db/metadata.json"
+    [[ -x "$tmp/remove.sh" ]] && cp "$tmp/remove.sh" "$pkg_db/remove.sh"
+    if [[ -d "$tmp/files" ]]; then
+        (cd "$tmp/files" && find . \( -type f -o -type l \) -printf '/%P\n') > "$pkg_db/files.list"
+    else
+        : > "$pkg_db/files.list"
+    fi
+    printf '%s\n' "$backup_dir" > "$pkg_db/last-backup"
+    rm -rf "$tmp"
+    log_msg "$LOG_FILE" "Installed $name"
+}
+
+install_package() {
+    local name="$1"
+    ensure_index
+    if is_installed "$name"; then
+        log_msg "$LOG_FILE" "$name is already installed"
+        return
+    fi
+    package_json "$name" >/dev/null || die "Package not found: $name"
+    local archive
+    archive="$(download_package "$name")"
+    install_archive "$name" "$archive"
+}
+
+remove_package() {
+    local name="$1"
+    need_root
+    local pkg_db="${INSTALLED_DIR}/${name}"
+    [[ -d "$pkg_db" ]] || die "$name is not installed"
+    if [[ -x "$pkg_db/remove.sh" ]]; then
+        bash "$pkg_db/remove.sh"
+    fi
+    tac "$pkg_db/files.list" | while read -r path; do
+        [[ -n "$path" && "$path" != "/" && -e "$path" ]] && rm -f "$path"
+        dir="$(dirname "$path")"
+        while [[ "$dir" != "/" && "$dir" != "." ]]; do
+            rmdir "$dir" 2>/dev/null || break
+            dir="$(dirname "$dir")"
+        done
+    done
+    rm -rf "$pkg_db"
+    log_msg "$LOG_FILE" "Removed $name"
+}
+
+rollback_package() {
+    local name="$1"
+    need_root
+    local pkg_db="${INSTALLED_DIR}/${name}"
+    [[ -d "$pkg_db" ]] || die "$name is not installed"
+    [[ -f "$pkg_db/last-backup" ]] || die "No rollback data for $name"
+    local backup_dir
+    backup_dir="$(cat "$pkg_db/last-backup")"
+    [[ -d "$backup_dir" ]] || die "Rollback directory missing: $backup_dir"
+
+    tac "$pkg_db/files.list" | while read -r path; do
+        [[ -n "$path" && "$path" != "/" && -e "$path" ]] && rm -f "$path"
+    done
+    if [[ -d "$backup_dir/files" ]]; then
+        tar -C "$backup_dir/files" -cpf - . | tar -C / -xpf -
+    fi
+    log_msg "$LOG_FILE" "Rolled back $name"
+}
+
+search_packages() {
+    local query="${1:-}"
+    ensure_index
+    jq -r --arg q "$query" '
+        .packages[]
+        | select(($q == "") or (.name | test($q; "i")) or (.description | test($q; "i")))
+        | "\(.name)\t\(.version)\t\(.description)"
+    ' "$INDEX_FILE"
+}
+
+list_installed() {
+    init_dirs
+    find "$INSTALLED_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
+current_release() {
+    local version codename
+    version="$(grep -E '^VERSION_ID=' /etc/os-release | cut -d= -f2- | tr -d '"')"
+    codename="$(grep -E '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2- | tr -d '"')"
+    printf '%s-%s' "$version" "$codename"
+}
+
+fetch_release_file() {
+    local rel_dir="$1"
+    local file="$2"
+    local dest="$3"
+    fetch_url "$(join_url "$RELEASES_URL" "${rel_dir}/${file}")" "$dest"
+}
+
+release_index() {
+    local dest="$1"
+    fetch_url "$(join_url "$RELEASES_URL" "index.json")" "$dest"
+    jq empty "$dest"
+}
+
+select_release() {
+    local index="$1"
+    local current="$2"
+    local target="${3:-}"
+    if [[ -n "$target" ]]; then
+        jq -er --arg target "$target" '.releases[] | select(.version == $target or (.version + "-" + .codename) == $target)' "$index"
+    else
+        jq -er --arg current "$current" '
+            [.releases[] | select(.compatible_versions[]? == $current)]
+            | sort_by(.release_date)
+            | last
+        ' "$index"
+    fi
+}
+
+create_snapshot() {
+    need_root
+    init_dirs
+    local snap="${SNAPSHOT_DIR}/$(date -u '+%Y%m%d%H%M%S')-$(current_release)"
+    mkdir -p "$snap"
+    log_msg "$SYSTEM_LOG_FILE" "Creating snapshot $snap"
+    tar --zstd -cpf "$snap/system.tar.zst" \
+        --exclude=/home \
+        /etc /boot /usr/local /opt/operalinux /var/lib/violin/installed 2>/dev/null || true
+    pacman -Qq > "$snap/pacman-all.txt" 2>/dev/null || true
+    pacman -Qqe > "$snap/pacman-explicit.txt" 2>/dev/null || true
+    list_installed > "$snap/violin-packages.txt" 2>/dev/null || true
+    cp /etc/os-release "$snap/os-release" 2>/dev/null || true
+
+    mapfile -t old < <(find "$SNAPSHOT_DIR" -mindepth 1 -maxdepth 1 -type d | sort)
+    while [[ "${#old[@]}" -gt "$SNAPSHOT_KEEP" ]]; do
+        rm -rf "${old[0]}"
+        old=("${old[@]:1}")
+    done
+    printf '%s\n' "$snap"
+}
+
+show_snapshots() {
+    init_dirs
+    find "$SNAPSHOT_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+}
+
+restore_snapshot() {
+    need_root
+    init_dirs
+    mapfile -t snaps < <(show_snapshots)
+    [[ "${#snaps[@]}" -gt 0 ]] || die "No snapshots found"
+    printf 'Available snapshots:\n'
+    local i
+    for i in "${!snaps[@]}"; do
+        printf '  %d) %s\n' "$((i + 1))" "${snaps[$i]}"
+    done
+    local choice
+    read -r -p 'Snapshot number: ' choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || die "Invalid snapshot number"
+    [[ "$choice" -ge 1 && "$choice" -le "${#snaps[@]}" ]] || die "Snapshot number out of range"
+    local snap="${SNAPSHOT_DIR}/${snaps[$((choice - 1))]}"
+    [[ -f "$snap/system.tar.zst" ]] || die "Snapshot archive missing"
+    log_msg "$SYSTEM_LOG_FILE" "Restoring snapshot $snap"
+    tar -xpf "$snap/system.tar.zst" -C /
+    if [[ -s "$snap/pacman-explicit.txt" ]]; then
+        mapfile -t pkgs < "$snap/pacman-explicit.txt"
+        pacman -S --needed --noconfirm "${pkgs[@]}" || true
+    fi
+    command -v mkinitcpio >/dev/null 2>&1 && mkinitcpio -P || true
+    command -v grub-mkconfig >/dev/null 2>&1 && grub-mkconfig -o /boot/grub/grub.cfg || true
+    log_msg "$SYSTEM_LOG_FILE" "Rollback complete"
+}
+
+system_check() {
+    need jq
+    init_dirs
+    local tmp="${CACHE_DIR}/releases-index.json"
+    release_index "$tmp"
+    local current
+    current="$(current_release)"
+    printf 'Current release: %s\n' "$current"
+    if select_release "$tmp" "$current" >/dev/null; then
+        printf 'Compatible upgrade available.\n'
+    else
+        printf 'No compatible upgrade found.\n'
+    fi
+}
+
+system_status() {
+    printf 'OperaLinux release: %s\n' "$(current_release)"
+    printf 'Violin packages: %s\n' "$(list_installed | wc -l)"
+    printf 'Snapshots: %s\n' "$(show_snapshots | wc -l)"
+}
+
+system_upgrade() {
+    need_root
+    need jq
+    init_dirs
+
+    local target=""
+    if [[ "${1:-}" == "--target" ]]; then
+        target="${2:-}"
+        [[ -n "$target" ]] || die "--target requires a version"
+    fi
+
+    local tmpdir current rel rel_dir manifest packages post delta checksum
+    tmpdir="$(mktemp -d)"
+    trap "rm -rf '$tmpdir'" EXIT
+
+    release_index "$tmpdir/index.json"
+    current="$(current_release)"
+    rel="$(select_release "$tmpdir/index.json" "$current" "$target")" || die "No compatible release found"
+    rel_dir="$(jq -r '.path' <<<"$rel")"
+
+    fetch_release_file "$rel_dir" manifest.json "$tmpdir/manifest.json"
+    fetch_release_file "$rel_dir" packages.json "$tmpdir/packages.json"
+    fetch_release_file "$rel_dir" post-upgrade.sh "$tmpdir/post-upgrade.sh"
+    fetch_release_file "$rel_dir" rootfs-delta.tar.zst "$tmpdir/rootfs-delta.tar.zst"
+
+    for payload in rootfs-delta.tar.zst packages.json post-upgrade.sh; do
+        checksum="$(jq -r --arg payload "$payload" '.checksums[$payload]' "$tmpdir/manifest.json")"
+        printf '%s  %s\n' "$checksum" "$tmpdir/$payload" | sha256sum -c -
+    done
+
+    printf 'Upgrade plan:\n'
+    jq -r '"  Target: \(.version) \"\(.codename)\"",
+           "  Required kernel: \(.required_kernel)",
+           "  Package changes:",
+           (.package_changes[]? | "    - " + .)' "$tmpdir/manifest.json"
+
+    read -r -p 'Proceed with upgrade? [y/N]: ' answer
+    [[ "$answer" == "y" || "$answer" == "Y" ]] || die "Upgrade cancelled"
+
+    create_snapshot >/dev/null
+    log_msg "$SYSTEM_LOG_FILE" "Upgrading pacman packages"
+    pacman -Syu --noconfirm
+
+    log_msg "$SYSTEM_LOG_FILE" "Upgrading violin repository packages"
+    violin_update
+    while read -r pkg; do
+        [[ -n "$pkg" ]] && install_package "$pkg"
+    done < <(jq -r '.install[]?' "$tmpdir/packages.json")
+
+    log_msg "$SYSTEM_LOG_FILE" "Applying rootfs delta"
+    tar -xpf "$tmpdir/rootfs-delta.tar.zst" -C /
+    bash "$tmpdir/post-upgrade.sh"
+    command -v mkinitcpio >/dev/null 2>&1 && mkinitcpio -P || true
+    command -v grub-mkconfig >/dev/null 2>&1 && grub-mkconfig -o /boot/grub/grub.cfg || true
+    log_msg "$SYSTEM_LOG_FILE" "System upgrade complete"
+    rm -rf "$tmpdir"
+    trap - EXIT
+}
+
+usage() {
+    cat <<'EOF_USAGE'
+violin get <package>
+violin remove <package>
+violin rollback <package>
+violin search <package>
+violin update
+violin list
+violin system check
+violin system upgrade [--target VERSION]
+violin system rollback
+violin system snapshots
+violin system status
+EOF_USAGE
+}
+
+main() {
+    need jq
+    need tar
+    need sha256sum
+    init_dirs
+    local cmd="${1:-}"
+    case "$cmd" in
+        get)
+            need_root
+            [[ -n "${2:-}" ]] || die "Package name required"
+            install_package "$2"
+            ;;
+        remove)
+            [[ -n "${2:-}" ]] || die "Package name required"
+            remove_package "$2"
+            ;;
+        rollback)
+            [[ -n "${2:-}" ]] || die "Package name required"
+            rollback_package "$2"
+            ;;
+        search)
+            search_packages "${2:-}"
+            ;;
+        update)
+            violin_update
+            ;;
+        list)
+            list_installed
+            ;;
+        system)
+            case "${2:-}" in
+                check) system_check ;;
+                upgrade) shift 2; system_upgrade "$@" ;;
+                rollback) restore_snapshot ;;
+                snapshots) show_snapshots ;;
+                status) system_status ;;
+                *) usage; exit 2 ;;
+            esac
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

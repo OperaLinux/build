@@ -1,0 +1,17 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = systemd
+Target = systemd-libs
+Target = systemd-sysvcompat
+Target = systemd-resolvconf
+Target = systemd-ukify
+Target = systemd-openrc
+Target = libsystemd
+
+[Action]
+Description = Refusing packages that violate OperaLinux OpenRC policy
+When = PreTransaction
+Exec = /usr/local/bin/operalinux-no-systemd-guard hook
+AbortOnFail

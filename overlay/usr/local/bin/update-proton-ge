@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+api_url="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
+global_dir="/usr/share/steam/compatibilitytools.d"
+user_dir="${HOME}/.steam/root/compatibilitytools.d"
+
+need() {
+    command -v "$1" >/dev/null 2>&1 || {
+        printf 'Missing required command: %s\n' "$1" >&2
+        exit 1
+    }
+}
+
+need curl
+need jq
+need tar
+need sha256sum
+
+install_dir="$user_dir"
+if [[ "${EUID}" -eq 0 ]]; then
+    install_dir="$global_dir"
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+printf 'Checking latest Proton GE release...\n'
+curl -fsSL "$api_url" -o "$tmp/release.json"
+
+archive_url="$(jq -r '.assets[] | select(.name | test("\\.tar\\.gz$")) | .browser_download_url' "$tmp/release.json" | head -n 1)"
+checksum_url="$(jq -r '.assets[] | select(.name | test("\\.sha512sum$|\\.sha256sum$")) | .browser_download_url' "$tmp/release.json" | head -n 1)"
+tag="$(jq -r '.tag_name' "$tmp/release.json")"
+
+[[ -n "$archive_url" && "$archive_url" != "null" ]] || {
+    printf 'Could not find a Proton GE tarball in the latest release.\n' >&2
+    exit 1
+}
+
+archive="${tmp}/${archive_url##*/}"
+curl -fL "$archive_url" -o "$archive"
+
+if [[ -n "$checksum_url" && "$checksum_url" != "null" ]]; then
+    checksum_file="${tmp}/${checksum_url##*/}"
+    curl -fL "$checksum_url" -o "$checksum_file"
+    expected="$(grep -F "${archive_url##*/}" "$checksum_file" | awk '{print $1}' | head -n 1 || true)"
+    if [[ -n "$expected" ]]; then
+        actual="$(sha256sum "$archive" | awk '{print $1}')"
+        if [[ "${#expected}" -eq 128 ]]; then
+            actual="$(sha512sum "$archive" | awk '{print $1}')"
+        fi
+        [[ "$actual" == "$expected" ]] || {
+            printf 'Checksum verification failed for %s\n' "$archive" >&2
+            exit 1
+        }
+    else
+        printf 'Checksum file did not name the archive; continuing after HTTPS download.\n' >&2
+    fi
+fi
+
+mkdir -p "$install_dir"
+tar -xzf "$archive" -C "$install_dir"
+printf 'Installed Proton GE %s into %s\n' "$tag" "$install_dir"

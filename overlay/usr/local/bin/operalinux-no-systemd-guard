@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+deny_file="/etc/operalinux/no-systemd-denylist"
+[[ -r "$deny_file" ]] || exit 0
+
+if [[ "${1:-}" == "hook" ]]; then
+    printf 'OperaLinux refuses this transaction because it matches the OpenRC-only denylist.\n' >&2
+    exit 1
+fi
+
+while read -r pkg; do
+    [[ -z "$pkg" || "${pkg:0:1}" == "#" ]] && continue
+    if grep -Eq "(^|[[:space:]])${pkg}([[:space:]]|$)" /dev/stdin 2>/dev/null; then
+        printf 'OperaLinux refuses package %s because this system is OpenRC only.\n' "$pkg" >&2
+        exit 1
+    fi
+done < "$deny_file"
+
+exit 0

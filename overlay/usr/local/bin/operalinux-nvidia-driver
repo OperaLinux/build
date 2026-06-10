@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    printf 'Usage: operalinux-nvidia-driver [open|proprietary|status]\n'
+}
+
+mode="${1:-status}"
+
+case "$mode" in
+    status)
+        pacman -Qs '^nvidia' || true
+        ;;
+    open)
+        sudo pacman -S --needed nvidia-open-dkms nvidia-utils lib32-nvidia-utils nvidia-settings
+        ;;
+    proprietary)
+        sudo pacman -S --needed nvidia-dkms nvidia-utils lib32-nvidia-utils nvidia-settings
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

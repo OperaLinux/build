@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+real_yay="/usr/bin/yay"
+deny_file="/etc/operalinux/no-systemd-denylist"
+
+if [[ ! -x "$real_yay" ]]; then
+    printf 'yay is not installed at %s\n' "$real_yay" >&2
+    exit 127
+fi
+
+if [[ -r "$deny_file" && "$#" -gt 0 ]]; then
+    case " $* " in
+        *" -S "*|*" --sync "*|*" -Sy "*|*" -Syu "*)
+            for arg in "$@"; do
+                [[ "$arg" == -* ]] && continue
+                if grep -Fxq "$arg" "$deny_file"; then
+                    printf 'OperaLinux warning: %s violates the OpenRC-only policy.\n' "$arg" >&2
+                    exit 1
+                fi
+                info="$("$real_yay" -Si "$arg" 2>/dev/null || true)"
+                while read -r denied; do
+                    [[ -z "$denied" || "${denied:0:1}" == "#" ]] && continue
+                    if grep -Eq "Depends On|Make Deps|Check Deps" <<<"$info" &&
+                        grep -Eq "(^|[<>=[:space:]])${denied}([<>=[:space:]]|$)" <<<"$info"; then
+                        printf 'OperaLinux warning: %s appears to depend on %s, which violates the OpenRC-only policy.\n' "$arg" "$denied" >&2
+                        exit 1
+                    fi
+                done < "$deny_file"
+            done
+            ;;
+    esac
+fi
+
+exec "$real_yay" "$@"
