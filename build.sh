@@ -200,6 +200,9 @@ copy_pacman_configuration() {
     install -Dm644 "${CONFIG_DIR}/pacman.conf" "${ROOTFS_DIR}/etc/pacman.conf"
     install -Dm644 "${CONFIG_DIR}/pacman.d/mirrorlist" "${ROOTFS_DIR}/etc/pacman.d/mirrorlist"
     install -Dm644 "${CONFIG_DIR}/pacman.d/mirrorlist-arch" "${ROOTFS_DIR}/etc/pacman.d/mirrorlist-arch"
+    if [[ -s /etc/resolv.conf ]]; then
+        install -Dm644 /etc/resolv.conf "${ROOTFS_DIR}/etc/resolv.conf"
+    fi
 }
 
 copy_project_payload() {
@@ -265,7 +268,9 @@ install_proton_ge() {
         return
     fi
     log "INFO" "Installing latest Proton GE"
-    chroot_run "chmod 0755 /usr/local/bin/update-proton-ge && /usr/local/bin/update-proton-ge"
+    if ! chroot_run "chmod 0755 /usr/local/bin/update-proton-ge && /usr/local/bin/update-proton-ge"; then
+        log "WARN" "Proton GE install failed, likely because GitHub or DNS is unavailable; continuing ISO build"
+    fi
 }
 
 install_yay() {
