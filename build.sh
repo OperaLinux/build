@@ -65,6 +65,12 @@ check_host_dependencies() {
     fi
 }
 
+kill_rootfs_processes() {
+    if have fuser; then
+        fuser -km "${ROOTFS_DIR}" >/dev/null 2>&1 || true
+    fi
+}
+
 clean_pacman_keyring_sockets() {
     local keyring_dir="/etc/pacman.d/gnupg"
     [[ -d "$keyring_dir" ]] || return 0
@@ -84,7 +90,10 @@ cleanup_mounts() {
         "${ROOTFS_DIR}/proc" \
         "${ROOTFS_DIR}/sys"; do
         if mountpoint -q "$mountpoint"; then
-            umount -R "$mountpoint" || true
+            if ! umount -R "$mountpoint" 2>/dev/null; then
+                kill_rootfs_processes
+                umount -R "$mountpoint" 2>/dev/null || umount -Rl "$mountpoint" 2>/dev/null || true
+            fi
         fi
     done
 }
@@ -96,6 +105,7 @@ trap cleanup EXIT
 
 prepare_workspace() {
     log "INFO" "Preparing workspace"
+    cleanup_mounts
     rm -rf "$WORK_DIR"
     mkdir -p "$ROOTFS_DIR" "$ISO_DIR" "$OUTPUT_DIR" "$LOG_DIR"
     : > "$LOG_FILE"
@@ -195,6 +205,8 @@ copy_pacman_configuration() {
 copy_project_payload() {
     log "INFO" "Installing OperaLinux overlay, Sonnet, and Violin"
     cp -a "${OVERLAY_DIR}/." "$ROOTFS_DIR/"
+    find "${ROOTFS_DIR}/usr/local/bin" -maxdepth 1 -type f -exec chmod 0755 {} + 2>/dev/null || true
+    find "${ROOTFS_DIR}/opt/operalinux/debian-coreutils/bin" -maxdepth 1 -type f -exec chmod 0755 {} + 2>/dev/null || true
     install -Dm755 "$SONNET_SRC" "${ROOTFS_DIR}/usr/bin/sonnet"
     install -Dm755 "$VIOLIN_SRC" "${ROOTFS_DIR}/usr/bin/violin"
     install -Dm644 "${CONFIG_DIR}/no-systemd-denylist.txt" "${ROOTFS_DIR}/etc/operalinux/no-systemd-denylist"
@@ -253,7 +265,7 @@ install_proton_ge() {
         return
     fi
     log "INFO" "Installing latest Proton GE"
-    chroot_run "update-proton-ge"
+    chroot_run "chmod 0755 /usr/local/bin/update-proton-ge && /usr/local/bin/update-proton-ge"
 }
 
 install_yay() {
