@@ -273,18 +273,49 @@ install_proton_ge() {
     fi
 }
 
+disable_chroot_pacman_checkspace() {
+    local pacman_conf="${ROOTFS_DIR}/etc/pacman.conf"
+    local backup="${ROOTFS_DIR}/etc/pacman.conf.operalinux-build-backup"
+    [[ -f "$pacman_conf" ]] || return 0
+    cp "$pacman_conf" "$backup"
+    sed -i 's/^[[:space:]]*CheckSpace/# CheckSpace disabled during OperaLinux chroot bootstrap/' "$pacman_conf"
+}
+
+restore_chroot_pacman_checkspace() {
+    local pacman_conf="${ROOTFS_DIR}/etc/pacman.conf"
+    local backup="${ROOTFS_DIR}/etc/pacman.conf.operalinux-build-backup"
+    if [[ -f "$backup" ]]; then
+        mv "$backup" "$pacman_conf"
+    fi
+}
+
 install_yay() {
     log "INFO" "Installing yay AUR helper"
+    disable_chroot_pacman_checkspace
+    local status=0
+
     if chroot_run "pacman -Si yay >/dev/null 2>&1"; then
-        chroot_run "pacman -S --needed --noconfirm yay"
-        return
+        chroot_run "pacman -S --needed --noconfirm yay" || status=$?
+        restore_chroot_pacman_checkspace
+        return "$status"
     fi
 
-    chroot_run "useradd -m -r -s /bin/bash build-yay || true"
-    chroot_run "printf 'build-yay ALL=(ALL) NOPASSWD: /usr/bin/pacman\n' > /etc/sudoers.d/90-build-yay && chmod 0440 /etc/sudoers.d/90-build-yay"
-    chroot_run "cd /tmp && rm -rf yay-bin && runuser -u build-yay -- git clone https://aur.archlinux.org/yay-bin.git"
-    chroot_run "cd /tmp/yay-bin && runuser -u build-yay -- makepkg -si --noconfirm --needed"
+    chroot_run "useradd -m -r -s /bin/bash build-yay || true" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+        chroot_run "printf 'build-yay ALL=(ALL) NOPASSWD: /usr/bin/pacman\n' > /etc/sudoers.d/90-build-yay && chmod 0440 /etc/sudoers.d/90-build-yay" || status=$?
+    fi
+    if [[ "$status" -eq 0 ]]; then
+        chroot_run "cd /tmp && rm -rf yay-bin && runuser -u build-yay -- git clone https://aur.archlinux.org/yay-bin.git" || status=$?
+    fi
+    if [[ "$status" -eq 0 ]]; then
+        chroot_run "cd /tmp/yay-bin && runuser -u build-yay -- makepkg -s --noconfirm --needed" || status=$?
+    fi
+    if [[ "$status" -eq 0 ]]; then
+        chroot_run "pacman -U --noconfirm /tmp/yay-bin/yay-bin-*.pkg.tar.*" || status=$?
+    fi
     chroot_run "rm -rf /tmp/yay-bin /etc/sudoers.d/90-build-yay && userdel -r build-yay || true"
+    restore_chroot_pacman_checkspace
+    return "$status"
 }
 
 configure_initramfs() {
